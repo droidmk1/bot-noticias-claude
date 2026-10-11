@@ -81,6 +81,10 @@ def obtener_noticias(ventana_min: int, ya_enviados: set) -> list[dict]:
             enlace = entrada.get("link", "")
             if fecha < desde or enlace in ya_enviados or any(r in enlace for r in RUTAS_EXCLUIDAS):
                 continue
+            # Algunos medios reactualizan notas viejas: si la URL trae fecha (/2026/08/21/), manda esa
+            fecha_url = re.search(r"/(20\d\d)/(\d\d)/(\d\d)/", enlace)
+            if fecha_url and datetime(*map(int, fecha_url.groups()), tzinfo=LIMA) < desde - timedelta(days=1):
+                continue
             noticias.append({
                 "medio": medio,
                 "titulo": entrada.get("title", "").strip(),
@@ -97,24 +101,74 @@ def _sin_html(texto: str) -> str:
     return re.sub(r"<[^>]+>", " ", texto).strip()
 
 
-# ---------- resumen ----------
+# ---------- top de la hora ----------
 
-PROMPT_SISTEMA = """Eres un editor de noticias peruano. Recibes titulares de medios de Perú publicados en la última hora \
-y escribes un resumen breve para leer en Telegram.
+STOPWORDS = set("""a al ante con contra de del desde el en entre es la las lo los para por que se sin
+su sus tras un una uno y o e ni como mas más pero sobre este esta estos estas ese esa fue son ser hoy
+tras vivo en-vivo dónde donde qué cuándo cómo así sus perú peru peruano peruanos lima""".split())
+
+# Secciones con más peso: noticias nacionales de interés general
+SECCIONES_PRIORITARIAS = ("/politica", "/economia", "/peru", "/lima", "/judiciales", "/actualidad", "/sociedad")
+
+
+def _palabras(titulo: str) -> set[str]:
+    return {w for w in re.findall(r"\w+", titulo.lower()) if len(w) > 3 and w not in STOPWORDS}
+
+
+def seleccionar_top(noticias: list[dict], n: int) -> list[dict]:
+    """Agrupa titulares que hablan de lo mismo y prioriza lo que cubren más medios."""
+    grupos: list[list[dict]] = []
+    for noticia in noticias:
+        p = _palabras(noticia["titulo"])
+        for grupo in grupos:
+            q = set().union(*(_palabras(x["titulo"]) for x in grupo))
+            comunes = len(p & q)
+            # Misma noticia si comparten buena parte de las palabras o al menos 3 clave
+            if comunes >= 3 or (p and q and comunes / len(p | q) >= 0.3):
+                grupo.append(noticia)
+                break
+        else:
+            grupos.append([noticia])
+
+    def puntuar(grupo: list[dict]) -> float:
+        medios = {x["medio"] for x in grupo}
+        principal = grupo[0]
+        puntos = 10 * len(medios)
+        if any(s in principal["enlace"] for s in SECCIONES_PRIORITARIAS):
+            puntos += 3
+        # Desempate por lo más reciente
+        return puntos + principal["fecha"].timestamp() / 1e10
+
+    grupos.sort(key=puntuar, reverse=True)
+    top, por_medio = [], {}
+    for grupo in grupos:
+        principal = grupo[0]
+        # Máximo 2 por medio para que no domine uno solo
+        if por_medio.get(principal["medio"], 0) >= 2:
+            continue
+        por_medio[principal["medio"]] = por_medio.get(principal["medio"], 0) + 1
+        principal["otros_medios"] = sorted({x["medio"] for x in grupo} - {principal["medio"]})
+        top.append(principal)
+        if len(top) == n:
+            break
+    return top
+
+
+PROMPT_SISTEMA = """Eres un editor de noticias peruano. Recibes titulares de medios de Perú publicados en la última hora.
+Elige las {n} noticias más importantes para un lector en Perú (prioriza política, economía, seguridad y sociedad \
+nacionales; las repetidas en varios medios suelen ser las más relevantes) y escribe una lista numerada.
 
 Reglas:
-- Escribe en español neutro, tono informativo, sin opinión.
-- Agrupa por tema (política, economía, sociedad, deportes, internacional, etc.); omite temas sin noticias.
-- Une las noticias repetidas entre medios en un solo punto.
-- Cada punto: una o dos frases y el enlace a una fuente con <a href="URL">Medio</a>.
+- Español neutro, tono informativo, sin opinión.
+- Cada punto: el número, un titular propio en <b>negrita</b>, una frase de contexto y el enlace \
+<a href="URL">Medio</a> a una de las fuentes.
 - Formato: solo HTML de Telegram (<b>, <i>, <a href>). Nada de Markdown, nada de otras etiquetas.
-- Empieza con una línea de 1-2 frases con lo más importante de la hora.
-- Máximo unas 2500 caracteres."""
+- Solo la lista, sin introducción ni cierre."""
 
 
-def resumir_con_claude(noticias: list[dict]) -> str:
+def top_con_claude(noticias: list[dict], n: int) -> str:
     lista = "\n".join(
-        f"- [{n['medio']}] {n['titulo']} — {n['resumen']} ({n['enlace']})" for n in noticias
+        f"- [{x['medio']}] {x['titulo']} — {x['resumen']} ({x['enlace']})" for x in noticias
     )
     client = anthropic.Anthropic()
     response = client.beta.messages.create(
@@ -123,7 +177,7 @@ def resumir_con_claude(noticias: list[dict]) -> str:
         output_config={"effort": "low"},
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
-        system=PROMPT_SISTEMA,
+        system=PROMPT_SISTEMA.format(n=n),
         messages=[{"role": "user", "content": f"Noticias de la última hora:\n{lista}"}],
     )
     if response.stop_reason == "refusal":
@@ -131,33 +185,30 @@ def resumir_con_claude(noticias: list[dict]) -> str:
     return "".join(b.text for b in response.content if b.type == "text").strip()
 
 
-def resumen_simple(noticias: list[dict]) -> str:
-    """Resumen sin IA: titulares agrupados por medio."""
-    partes = []
-    por_medio: dict[str, list[dict]] = {}
-    for n in noticias:
-        por_medio.setdefault(n["medio"], []).append(n)
-    for medio, items in por_medio.items():
-        partes.append(f"\n<b>{html.escape(medio)}</b>")
-        for n in items[:8]:
-            partes.append(f'• <a href="{html.escape(n["enlace"], quote=True)}">{html.escape(n["titulo"])}</a>')
-    return "\n".join(partes).strip()
+def top_simple(noticias: list[dict], n: int) -> str:
+    """Top sin IA: titulares más repetidos entre medios."""
+    lineas = []
+    for i, x in enumerate(seleccionar_top(noticias, n), 1):
+        enlace = html.escape(x["enlace"], quote=True)
+        extra = f" (+{len(x['otros_medios'])} medios)" if x["otros_medios"] else ""
+        lineas.append(f'{i}. <b>{html.escape(x["titulo"])}</b>\n    <a href="{enlace}">{html.escape(x["medio"])}</a>{extra}')
+    return "\n\n".join(lineas)
 
 
-def construir_mensaje(noticias: list[dict], ventana_min: int) -> str:
+def construir_mensaje(noticias: list[dict], n: int) -> str:
     ahora = datetime.now(LIMA).strftime("%d/%m %H:%M")
-    cabecera = f"🇵🇪 <b>Noticias de Perú</b> — última hora ({ahora})\n\n"
+    cabecera = f"🇵🇪 <b>Top {n} de Perú</b> — última hora ({ahora})\n\n"
 
     cuerpo = None
     if os.getenv("ANTHROPIC_API_KEY"):
         try:
-            cuerpo = resumir_con_claude(noticias)
+            cuerpo = top_con_claude(noticias, n)
         except anthropic.APIError as e:
-            log.error("Error de la API de Claude, uso resumen simple: %s", e)
+            log.error("Error de la API de Claude, uso top simple: %s", e)
         except RuntimeError as e:
-            log.error("%s, uso resumen simple", e)
+            log.error("%s, uso top simple", e)
     if not cuerpo:
-        cuerpo = resumen_simple(noticias)
+        cuerpo = top_simple(noticias, n)
     return cabecera + cuerpo
 
 
@@ -220,7 +271,7 @@ def ejecutar_ciclo(ventana_min: int, dry_run: bool) -> None:
         log.info("Sin noticias nuevas; no envío nada")
         return
 
-    mensaje = construir_mensaje(noticias, ventana_min)
+    mensaje = construir_mensaje(noticias, int(os.getenv("TOP_N", "5")))
     if dry_run:
         print(mensaje)
         return
